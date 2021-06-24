@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Run Apache Spark on an EKS Cluster managed with Step Functions
+
+Parameters:
+
+  ECRRepository:
+    Description: The name of the ECR repoosit where the spark binary will be uploaded
+    Type: String
+
+  BucketName:
+    Description: The bucket where the spark binary will be uploaded
+    Type : String
+
+  SubnetIds:
+    Description: The subnets where the eks cluster will be created
+    Type: String
+
+
+Resources:
+
+  SparkEKSStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SparkEKSStateMachineEKSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'eks:*'
+                Resource: "*"
+              - Effect: 'Allow'
+                Action: 'ec2:DescribeSubnets'
+                Resource: "*"
+              - Effect: 'Allow'
+                Action:
+                  - "iam:GetRole"
+                  - "iam:ListAttachedRolePolicies"
+                  - "iam:PassRole"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+
+  SparkEKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  SparkEKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  SparkEKSStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt SparkEKSStateMachineRole.Arn
+      DefinitionString:
+        !Sub
+        - |-
+          {
+            "Comment": "Create an EKS Cluster with 3 nodes and run a Spark 3 job",
+            "StartAt": "Create EKS cluster",
+            "States": {
+              "Create EKS cluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:createCluster.sync",
+                "Parameters": {
+                  "Name": "spark-on-eks",
+                  "RoleArn": "${SparkEKSClusterRoleArn}",
+                  "ResourcesVpcConfig": {
+                    "SubnetIds": [ "${SubnetIds}" ]
+                  }
+                },
+                "ResultPath": "$.eks",
+                "Next": "Create Service Account"
+              },
+              "Create Service Account": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:call",
+                "Parameters": {
+                  "ClusterName": "spark-on-eks",
+                  "CertificateAuthority.$": "$.eks.Cluster.CertificateAuthority.Data",
+                  "Endpoint.$": "$.eks.Cluster.Endpoint",
+                  "Method": "POST",
+                  "Path": "/api/v1/namespaces/default/serviceaccounts",
+                  "RequestBody": {
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {
+                      "name": "spark-service-account"
+                      }
+                    }
+                  },
+                  "ResultPath": "$.serviceaccount",
+                  "Next": "Apply RBAC"
+              },
+              "Apply RBAC": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:call",
+                "Parameters": {
+                  "ClusterName": "spark-on-eks",
+                  "CertificateAuthority.$": "$.eks.Cluster.CertificateAuthority.Data",
+                  "Endpoint.$": "$.eks.Cluster.Endpoint",
+                  "Method": "POST",
+                  "Path": "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+                  "RequestBody": {
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRoleBinding",
+                    "metadata": {
+                      "name": "spark-cluster-role-binding"
+                    },
+                    "roleRef": {
+                      "apiGroup": "rbac.authorization.k8s.io",
+                      "kind": "ClusterRole",
+                      "name": "edit"
+                    },
+                    "subjects": [
+                      {
+                        "kind": "ServiceAccount",
+                        "name": "spark-service-account",
+                        "namespace": "default"
+                      }
+                    ]
+                  }
+                },
+                "ResultPath": "$.rbac",
+                "Next": "Create a node group"
+              },
+              "Create a node group": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:createNodegroup.sync",
+                "Parameters": {
+                  "ClusterName": "spark-on-eks",
+                  "NodegroupName": "spark-nodes",
+                  "NodeRole": "${SparkEKSNodeRoleArn}",
+                  "InstanceTypes": [
+                    "m5.xlarge"
+                  ],
+                  "ScalingConfig": {
+                    "DesiredSize": 3,
+                    "MaxSize": 3,
+                    "MinSize": 3
+                  },
+                  "Subnets": [ "${SubnetIds}" ]
+                },
+                "ResultPath": "$.nodegroup",
+                "Next": "Run Spark job on EKS"
+              },
+              "Run Spark job on EKS": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:runJob.sync",
+                "Parameters": {
+                "ClusterName": "spark-on-eks",
+                "CertificateAuthority.$": "$.eks.Cluster.CertificateAuthority.Data",
+                "Endpoint.$": "$.eks.Cluster.Endpoint",
+                "Job": {
+                  "apiVersion": "batch/v1",
+                  "kind": "Job",
+                  "metadata": {
+                      "name": "spark-job"
+                  },
+                  "spec": {
+                    "backoffLimit": 0,
+                    "template": {
+                        "metadata": {
+                          "name": "spark-job"
+                        },
+                        "spec": {
+                          "containers": [
+                            {
+                              "name": "spark",
+                              "image": "${ECRRepository}/spark:v3.1.1",
+                              "command.$": "States.Array('/bin/sh', '-c', States.Format('/opt/spark/bin/spark-submit --master k8s://{}:443 --deploy-mode cluster --jar s3://${BucketName}/spark-on-eks-v1.0-assembly.jar --class com.jybesson.SparkOnEks --conf spark.kubernetes.container.image=${ECRRepository}/spark:v3.1.1 --conf spark.kubernetes.executor.container.image=${ECRRepository}/spark:v3.1.1 --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark-service-account', $.eks.Cluster.Endpoint))"
+                            }
+                          ],
+                          "serviceAccountName": "spark-service-account",
+                          "restartPolicy": "Never"
+                        }
+                    }
+                  }
+                }
+                },
+                "ResultSelector": {
+                  "status.$": "$.status",
+                  "logs.$": "$.logs..pi"
+                },
+                "ResultPath": "$.RunJobResult",
+                "Next": "Delete job"
+              },
+              "Delete job": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:call",
+                "Parameters": {
+                  "ClusterName": "spark-eks",
+                  "CertificateAuthority.$": "$.eks.Cluster.CertificateAuthority.Data",
+                  "Endpoint.$": "$.eks.Cluster.Endpoint",
+                  "Method": "DELETE",
+                  "Path": "/apis/batch/v1/namespaces/default/jobs/spark-job"
+                },
+                "ResultSelector": {
+                  "status.$": "$.ResponseBody.status"
+                },
+                "ResultPath": "$.DeleteJobResult",
+                "Next": "Delete node group"
+              },
+              "Delete node group": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:deleteNodegroup.sync",
+                "Parameters": {
+                  "ClusterName": "spark-eks",
+                  "NodegroupName": "spark-nodes"
+                },
+                "Next": "Delete cluster"
+              },
+              "Delete cluster": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::eks:deleteCluster.sync",
+                "Parameters": {
+                  "Name": "spark-eks"
+                },
+                "End": true
+              }
+            }
+          }
+        - { SparkEKSClusterRoleArn: !GetAtt [ SparkEKSClusterRole, Arn ], SparkEKSNodeRoleArn: !GetAtt [ SparkEKSNodeRole, Arn ] }
